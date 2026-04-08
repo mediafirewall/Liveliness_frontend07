@@ -240,6 +240,40 @@ const WebhookNotification = () => (
   </div>
 );
 
+// Banner shown when waiting for a human moderator to review the voice verification
+const AIGenPendingBanner = () => (
+  <div
+    style={{
+      marginTop: "1rem",
+      padding: "1.5rem",
+      borderRadius: "1rem",
+      background: "rgba(245, 158, 11, 0.1)",
+      border: "1px solid rgba(245, 158, 11, 0.35)",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      gap: "0.85rem",
+      animation: "fadeIn 0.4s ease-out",
+      textAlign: "center"
+    }}
+  >
+    <div style={{ color: "#fbbf24", display: "flex", flexDirection: "column", alignItems: "center", gap: "0.6rem" }}>
+      <span style={{ fontSize: "2rem" }}>👁️</span>
+      <span style={{ fontWeight: 900, fontSize: "1rem", letterSpacing: "0.08em", color: "white" }}>
+        AWAITING AIGen VERIFICATION
+      </span>
+    </div>
+    <div style={{ fontSize: "0.82rem", color: "rgba(251,191,36,0.85)", fontWeight: 600, lineHeight: 1.5 }}>
+      Your video recording has been queued for AIGen verification.<br />
+      The results will be sent via WebhookNotification
+    </div>
+    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.75rem", color: "rgba(255,255,255,0.4)" }}>
+      <RefreshCw size={12} className="spin-slow" />
+      Polling every 3s…
+    </div>
+  </div>
+);
+
 // --- Guidance Animation Component ---
 const GuidanceAnimation = ({ step }) => {
   if (!step) return null;
@@ -408,6 +442,7 @@ function MainApp({ onLogout, userId }) {
   const [isFaceAligned, setIsFaceAligned] = useState(false);
   const [showFaceWarning, setShowFaceWarning] = useState(false);
   const [isWebhookWaiting, setIsWebhookWaiting] = useState(false);
+  const [isAIGenPending, setIsAIGenPending] = useState(false);
   const [customError, setCustomError] = useState(null);
   const [notification, setNotification] = useState(null);
   const [webhookResponseJson, setWebhookResponseJson] = useState(null);
@@ -418,6 +453,34 @@ function MainApp({ onLogout, userId }) {
     setResponseJson(null);
     setChallengeRequestJson(null);
     setChallengeResponseJson(null);
+    setIsAIGenPending(false);
+  };
+
+  /**
+   * Polls /liveliness/result until AIGenPending becomes false.
+   * Returns the final document once available.
+   */
+  const pollForAIGenResult = async (pollUserId, pollRequestId, maxAttempts = 60) => {
+    setIsWebhookWaiting(false);
+    setIsAIGenPending(true);
+    let attempt = 0;
+    while (attempt < maxAttempts) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const res = await axios.get(`${API_BASE_URL}/result`, {
+          params: { userId: pollUserId, requestId: pollRequestId }
+        });
+        if (!res.data.AIGenPending) {
+          setIsAIGenPending(false);
+          return res.data;
+        }
+      } catch (e) {
+        console.warn("Poll attempt failed:", e);
+      }
+      attempt++;
+    }
+    setIsAIGenPending(false);
+    return null;
   };
 
   // Recording states
@@ -519,32 +582,43 @@ function MainApp({ onLogout, userId }) {
       // Map response to UI state
       if (mainTab === "aigenerated") {
         setMultiResults([]);
-        setIsWebhookWaiting(true);
-        await new Promise(r => setTimeout(r, 5000));
-        setIsWebhookWaiting(false);
-
-        // Fetch actual result
-        try {
-          const finalResp = await axios.get(`${API_BASE_URL}/result`, {
-            params: {
-              userId: payload.userId,
-              requestId: rid
-            }
-          });
-          setWebhookResponseJson(finalResp.data);
-
-          const passed = finalResp.data.processStatus?.AIGenerated && finalResp.data.processStatus?.Liveliness;
-          setResult(passed ? "passed" : "failed");
-          setNotification({
-            type: passed ? "passed" : "failed",
-            message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
-            timestamp: new Date().toLocaleTimeString()
-          });
-        } catch (fetchErr) {
-          console.error("Failed to fetch final result:", fetchErr);
-          // fallback to initial response if GET fails
-          const passed = data.AIGenerated ? "passed" : "failed";
-          setResult(passed);
+        // If AIGenPending, poll until human decides
+        if (data.AIGenPending) {
+          const finalDoc = await pollForAIGenResult(payload.userId, rid);
+          if (finalDoc) {
+            setWebhookResponseJson(finalDoc);
+            const passed = finalDoc.processStatus?.AIGenerated && finalDoc.processStatus?.Liveliness;
+            setResult(passed ? "passed" : "failed");
+            setNotification({
+              type: passed ? "passed" : "failed",
+              message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
+              timestamp: new Date().toLocaleTimeString()
+            });
+          } else {
+            setResult("error");
+          }
+        } else {
+          // Legacy path: already decided automatically
+          setIsWebhookWaiting(true);
+          await new Promise(r => setTimeout(r, 5000));
+          setIsWebhookWaiting(false);
+          try {
+            const finalResp = await axios.get(`${API_BASE_URL}/result`, {
+              params: { userId: payload.userId, requestId: rid }
+            });
+            setWebhookResponseJson(finalResp.data);
+            const passed = finalResp.data.processStatus?.AIGenerated && finalResp.data.processStatus?.Liveliness;
+            setResult(passed ? "passed" : "failed");
+            setNotification({
+              type: passed ? "passed" : "failed",
+              message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
+              timestamp: new Date().toLocaleTimeString()
+            });
+          } catch (fetchErr) {
+            console.error("Failed to fetch final result:", fetchErr);
+            const passed = data.AIGenerated ? "passed" : "failed";
+            setResult(passed);
+          }
         }
         setTimeout(() => setNotification(null), 5000);
       } else {
@@ -627,27 +701,41 @@ function MainApp({ onLogout, userId }) {
 
       if (isAIGen) {
         setMultiResults([]);
-        setIsWebhookWaiting(true);
-        await new Promise(r => setTimeout(r, 5000));
-        setIsWebhookWaiting(false);
-
-        // Fetch actual result from /result endpoint
-        try {
-          const finalResp = await axios.get(`${API_BASE_URL}/result`, {
-            params: { userId: userId || "demo_user", requestId: livelinessRequestId }
-          });
-          setWebhookResponseJson(finalResp.data);
-          const passed = finalResp.data.processStatus?.AIGenerated && finalResp.data.processStatus?.Liveliness;
-          setResult(passed ? "passed" : "failed");
-          setNotification({
-            type: passed ? "passed" : "failed",
-            message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
-            timestamp: new Date().toLocaleTimeString()
-          });
-        } catch (fetchErr) {
-          console.error("Failed to fetch final result:", fetchErr);
-          const passed = data.AIGenerated ? "passed" : "failed";
-          setResult(passed);
+        if (data.AIGenPending) {
+          const finalDoc = await pollForAIGenResult(userId || "demo_user", livelinessRequestId);
+          if (finalDoc) {
+            setWebhookResponseJson(finalDoc);
+            const passed = finalDoc.processStatus?.AIGenerated && finalDoc.processStatus?.Liveliness;
+            setResult(passed ? "passed" : "failed");
+            setNotification({
+              type: passed ? "passed" : "failed",
+              message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
+              timestamp: new Date().toLocaleTimeString()
+            });
+          } else {
+            setResult("error");
+          }
+        } else {
+          setIsWebhookWaiting(true);
+          await new Promise(r => setTimeout(r, 5000));
+          setIsWebhookWaiting(false);
+          try {
+            const finalResp = await axios.get(`${API_BASE_URL}/result`, {
+              params: { userId: userId || "demo_user", requestId: livelinessRequestId }
+            });
+            setWebhookResponseJson(finalResp.data);
+            const passed = finalResp.data.processStatus?.AIGenerated && finalResp.data.processStatus?.Liveliness;
+            setResult(passed ? "passed" : "failed");
+            setNotification({
+              type: passed ? "passed" : "failed",
+              message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
+              timestamp: new Date().toLocaleTimeString()
+            });
+          } catch (fetchErr) {
+            console.error("Failed to fetch final result:", fetchErr);
+            const passed = data.AIGenerated ? "passed" : "failed";
+            setResult(passed);
+          }
         }
         setTimeout(() => setNotification(null), 5000);
       } else {
@@ -726,27 +814,41 @@ function MainApp({ onLogout, userId }) {
 
       if (isAIGen) {
         setMultiResults([]);
-        setIsWebhookWaiting(true);
-        await new Promise(r => setTimeout(r, 5000));
-        setIsWebhookWaiting(false);
-
-        // Fetch actual result from /result endpoint
-        try {
-          const finalResp = await axios.get(`${API_BASE_URL}/result`, {
-            params: { userId: userId || "demo_user", requestId: livelinessRequestId }
-          });
-          setWebhookResponseJson(finalResp.data);
-          const passed = finalResp.data.processStatus?.AIGenerated && finalResp.data.processStatus?.Liveliness;
-          setResult(passed ? "passed" : "failed");
-          setNotification({
-            type: passed ? "passed" : "failed",
-            message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
-            timestamp: new Date().toLocaleTimeString()
-          });
-        } catch (fetchErr) {
-          console.error("Failed to fetch final result:", fetchErr);
-          const passed = data.AIGenerated ? "passed" : "failed";
-          setResult(passed);
+        if (data.AIGenPending) {
+          const finalDoc = await pollForAIGenResult(userId || "demo_user", livelinessRequestId);
+          if (finalDoc) {
+            setWebhookResponseJson(finalDoc);
+            const passed = finalDoc.processStatus?.AIGenerated && finalDoc.processStatus?.Liveliness;
+            setResult(passed ? "passed" : "failed");
+            setNotification({
+              type: passed ? "passed" : "failed",
+              message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
+              timestamp: new Date().toLocaleTimeString()
+            });
+          } else {
+            setResult("error");
+          }
+        } else {
+          setIsWebhookWaiting(true);
+          await new Promise(r => setTimeout(r, 5000));
+          setIsWebhookWaiting(false);
+          try {
+            const finalResp = await axios.get(`${API_BASE_URL}/result`, {
+              params: { userId: userId || "demo_user", requestId: livelinessRequestId }
+            });
+            setWebhookResponseJson(finalResp.data);
+            const passed = finalResp.data.processStatus?.AIGenerated && finalResp.data.processStatus?.Liveliness;
+            setResult(passed ? "passed" : "failed");
+            setNotification({
+              type: passed ? "passed" : "failed",
+              message: passed ? "AI Voice Verification Successful" : "AI Voice Verification Failed",
+              timestamp: new Date().toLocaleTimeString()
+            });
+          } catch (fetchErr) {
+            console.error("Failed to fetch final result:", fetchErr);
+            const passed = data.AIGenerated ? "passed" : "failed";
+            setResult(passed);
+          }
         }
         setTimeout(() => setNotification(null), 5000);
       } else {
@@ -1523,7 +1625,8 @@ function MainApp({ onLogout, userId }) {
                       : `Verify ${selectedSteps.length} Step(s)`}
                   </button>
                   {isWebhookWaiting && <WebhookNotification />}
-                  {webhookResponseJson && mainTab === "aigenerated" && !isWebhookWaiting && (
+                  {isAIGenPending && <AIGenPendingBanner />}
+                  {webhookResponseJson && mainTab === "aigenerated" && !isWebhookWaiting && !isAIGenPending && (
                     <div className="json-panel-container" style={{ marginTop: "1rem" }}>
                       <div className="json-panel-title">
                         <RefreshCw size={12} style={{ marginRight: "0.5rem" }} />
@@ -1534,7 +1637,7 @@ function MainApp({ onLogout, userId }) {
                       </div>
                     </div>
                   )}
-                  {result && !isWebhookWaiting && (
+                  {result && !isWebhookWaiting && !isAIGenPending && (
                     <ResultCard
                       result={result}
                       multiResults={multiResults}
@@ -1602,7 +1705,8 @@ function MainApp({ onLogout, userId }) {
                     {loading ? "Analyzing..." : `Analyze: ${selectedSteps[0]}`}
                   </button>
                   {isWebhookWaiting && <WebhookNotification />}
-                  {webhookResponseJson && mainTab === "aigenerated" && !isWebhookWaiting && (
+                  {isAIGenPending && <AIGenPendingBanner />}
+                  {webhookResponseJson && mainTab === "aigenerated" && !isWebhookWaiting && !isAIGenPending && (
                     <div className="json-panel-container" style={{ marginTop: "1rem" }}>
                       <div className="json-panel-title">
                         <RefreshCw size={12} style={{ marginRight: "0.5rem" }} />
@@ -1613,7 +1717,7 @@ function MainApp({ onLogout, userId }) {
                       </div>
                     </div>
                   )}
-                  {result && !isWebhookWaiting && (
+                  {result && mainTab !== "aigenerated" && !isWebhookWaiting && !isAIGenPending && (
                     <ResultCard
                       result={result}
                       multiResults={multiResults}
@@ -1725,6 +1829,12 @@ function MainApp({ onLogout, userId }) {
                       </div>
                     )}
 
+                    {isAIGenPending && (
+                      <div className="result-overlay passed" style={{ zIndex: 110 }}>
+                        <AIGenPendingBanner />
+                      </div>
+                    )}
+
                     {isRecording && (
                       <div className="recording-badge">
                         <div className="recording-dot" />
@@ -1788,7 +1898,7 @@ function MainApp({ onLogout, userId }) {
                         </div>
                       )}
 
-                    {result && (
+                    {result && mainTab !== "aigenerated" && (
                       <div className={`result-overlay ${result === "error" ? "failed" : result}`}>
                         {/* Celebration Particles for Success */}
                         {result === "passed" &&
@@ -2046,7 +2156,7 @@ function MainApp({ onLogout, userId }) {
                         </div>
                       </div>
                     )}
-                    {responseJson && (
+                    {responseJson && mainTab !== "aigenerated" && (
                       <div className="json-panel-container">
                         <div className="json-panel-title">
                           <RefreshCw size={12} style={{ marginRight: "0.5rem" }} />
